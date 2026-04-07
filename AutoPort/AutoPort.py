@@ -43,6 +43,7 @@ PORT_DECL_ITEM_RE = re.compile(
 )
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 LITERAL_RE = re.compile(r"^\d+'[bBoOdDhH][0-9a-fA-F_xXzZ?]+$|^[0-9]+$")
+SIGNAL_REF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)(?:\s*\[[^\]]+\]\s*)*$")
 
 
 class VerilogAnalysisError(Exception):
@@ -241,10 +242,13 @@ def extract_signal_name(expr: str) -> Optional[str]:
     expr = expr.strip()
     if not expr:
         return None
-    if IDENT_RE.match(expr):
-        return expr
     if LITERAL_RE.match(expr):
         return None
+    signal_match = SIGNAL_REF_RE.match(expr)
+    if signal_match:
+        return signal_match.group(1)
+    if IDENT_RE.match(expr):
+        return expr
     raise VerilogAnalysisError(
         f"Unsupported connection expression '{expr}'. Only simple net names or constants are supported."
     )
@@ -252,7 +256,8 @@ def extract_signal_name(expr: str) -> Optional[str]:
 
 def parse_instances(top_module: ModuleDef, module_library: Dict[str, ModuleDef]) -> List[InstancePortRef]:
     refs: List[InstancePortRef] = []
-    for match in INSTANCE_RE.finditer(top_module.body):
+    body_without_comments = strip_comments_preserve_layout(top_module.body)
+    for match in INSTANCE_RE.finditer(body_without_comments):
         submodule_name = match.group(1)
         instance_name = match.group(3)
         connections_text = match.group(4)
