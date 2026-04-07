@@ -1,74 +1,34 @@
 #!/usr/bin/env python3
 """Generate top-module port definitions from instantiated Verilog modules."""
 
+# TODO.1：识别已有的顶层端口并保留它们（如果它们与实例连接兼容）。这将允许增量迁移而不是一次性重构。
+# TODO.2：如果当前信号已在top module内被wire/reg声明，则将其保留为内部信号而不是提升为端口。这将允许更灵活的重构，而不仅仅是将所有连接提升为端口。
+
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+# Allow direct execution via `python3 AutoPort/AutoPort.py ...` by making the
+# repository root importable before loading shared helpers from `utils`.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-MODULE_RE = re.compile(
-    r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\s*(?:#\s*\((.*?)\))?\s*\((.*?)\)\s*;(.*?)\bendmodule\b",
-    re.S,
+from utils.PyUtils import ensure_trailing_newline, indent_block, replace_span
+from utils.VerilogUtils import (
+    DEFAULT_VERILOG_EXTENSIONS,
+    ModuleDef,
+    VerilogAnalysisError,
+    extract_base_signal_name,
+    format_port_decl,
+    get_target_top_module,
+    load_module_library,
+    parse_module_instances,
 )
-
-INSTANCE_RE = re.compile(
-    r"(?<!\bmodule\s)(?<!\bprimitive\s)(?<!\bendprimitive\s)"
-    r"\b([A-Za-z_][A-Za-z0-9_$]*)\s*"
-    r"(?:#\s*\((.*?)\))?\s+"
-    r"([A-Za-z_][A-Za-z0-9_$]*)\s*"
-    r"\((.*?)\)\s*;",
-    re.S,
-)
-
-PARAM_SPLIT_RE = re.compile(r",(?![^\(\[]*[\]\)])")
-PORT_CONNECTION_RE = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(\s*(.*?)\s*\)", re.S)
-DECL_RE = re.compile(
-    r"\b(input|output|inout)\b\s*"
-    r"(?:wire|reg|logic|signed|unsigned|tri|supply0|supply1|wand|wor|uwire|var|\s)*"
-    r"(\[[^\]]+\])?\s*"
-    r"([^;]+?)\s*;",
-    re.S,
-)
-PORT_DECL_ITEM_RE = re.compile(
-    r"^\s*(input|output|inout)\b\s*"
-    r"((?:wire|reg|logic|signed|unsigned|tri|supply0|supply1|wand|wor|uwire|var|\[[^\]]+\]|\s)*)"
-    r"([A-Za-z_][A-Za-z0-9_$]*)\s*$",
-    re.S,
-)
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
-LITERAL_RE = re.compile(r"^\d+'[bBoOdDhH][0-9a-fA-F_xXzZ?]+$|^[0-9]+$")
-SIGNAL_REF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)(?:\s*\[[^\]]+\]\s*)*$")
-
-
-class VerilogAnalysisError(Exception):
-    """Raised when the script detects unsupported or invalid Verilog structure."""
-
-
-@dataclass
-class PortDef:
-    name: str
-    direction: str
-    width: str = ""
-
-    @property
-    def width_clean(self) -> str:
-        return normalize_width(self.width)
-
-
-@dataclass
-class ModuleDef:
-    name: str
-    file_path: Path
-    ports: Dict[str, PortDef] = field(default_factory=dict)
-    parameters: str = ""
-    body: str = ""
-    span: Tuple[int, int] = (0, 0)
 
 
 @dataclass
@@ -90,177 +50,11 @@ class SignalAnalysis:
     refs: List[InstancePortRef]
 
 
-def strip_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r"//.*?$", "", text, flags=re.M)
-    return text
-
-
-def strip_comments_preserve_layout(text: str) -> str:
-    def replace_block(match: re.Match[str]) -> str:
-        return re.sub(r"[^\n]", " ", match.group(0))
-
-    def replace_line(match: re.Match[str]) -> str:
-        return re.sub(r"[^\n]", " ", match.group(0))
-
-    text = re.sub(r"/\*.*?\*/", replace_block, text, flags=re.S)
-    text = re.sub(r"//.*?$", replace_line, text, flags=re.M)
-    return text
-
-
-def normalize_width(width: str) -> str:
-    return re.sub(r"\s+", "", width or "")
-
-
-def split_top_level_csv(text: str) -> List[str]:
-    items: List[str] = []
-    current: List[str] = []
-    paren_depth = 0
-    bracket_depth = 0
-    brace_depth = 0
-
-    for char in text:
-        if char == "," and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
-            item = "".join(current).strip()
-            if item:
-                items.append(item)
-            current = []
-            continue
-        current.append(char)
-        if char == "(":
-            paren_depth += 1
-        elif char == ")":
-            paren_depth = max(paren_depth - 1, 0)
-        elif char == "[":
-            bracket_depth += 1
-        elif char == "]":
-            bracket_depth = max(bracket_depth - 1, 0)
-        elif char == "{":
-            brace_depth += 1
-        elif char == "}":
-            brace_depth = max(brace_depth - 1, 0)
-
-    tail = "".join(current).strip()
-    if tail:
-        items.append(tail)
-    return items
-
-
-def normalize_decl_names(names_text: str) -> List[str]:
-    names = []
-    for raw_name in split_top_level_csv(names_text):
-        name = raw_name.strip()
-        if "=" in name:
-            name = name.split("=", 1)[0].strip()
-        name = re.sub(r"\[[^\]]+\]", "", name).strip()
-        if not name:
-            continue
-        if not IDENT_RE.match(name):
-            raise VerilogAnalysisError(f"Unsupported declared port name: {raw_name}")
-        names.append(name)
-    return names
-
-
-def parse_header_ports(header_text: str) -> Dict[str, PortDef]:
-    ports: Dict[str, PortDef] = {}
-    for item in split_top_level_csv(header_text):
-        match = PORT_DECL_ITEM_RE.match(item)
-        if not match:
-            continue
-        direction, qualifiers, name = match.groups()
-        width_match = re.search(r"\[[^\]]+\]", qualifiers or "")
-        ports[name] = PortDef(name=name, direction=direction, width=width_match.group(0) if width_match else "")
-    return ports
-
-
-def parse_body_ports(body_text: str) -> Dict[str, PortDef]:
-    ports: Dict[str, PortDef] = {}
-    for direction, width, names_text in DECL_RE.findall(body_text):
-        for name in normalize_decl_names(names_text):
-            ports[name] = PortDef(name=name, direction=direction, width=width or "")
-    return ports
-
-
-def parse_modules_from_file(file_path: Path) -> Dict[str, ModuleDef]:
-    original_text = file_path.read_text(encoding="utf-8")
-    text = strip_comments_preserve_layout(original_text)
-    modules: Dict[str, ModuleDef] = {}
-    for match in MODULE_RE.finditer(text):
-        module_name = match.group(1)
-        header_ports = strip_comments(match.group(3))
-        body = original_text[match.start(4) : match.end(4)]
-        body_clean = strip_comments(match.group(4))
-        parameters = original_text[match.start(2) : match.end(2)] if match.group(2) else ""
-        port_map = parse_body_ports(body_clean)
-        port_map.update(parse_header_ports(header_ports))
-        modules[module_name] = ModuleDef(
-            name=module_name,
-            file_path=file_path,
-            ports=port_map,
-            parameters=parameters.strip(),
-            body=body,
-            span=(match.start(), match.end()),
-        )
-    return modules
-
-
-def load_module_library(search_root: Path, extensions: Sequence[str]) -> Dict[str, ModuleDef]:
-    module_defs: Dict[str, ModuleDef] = {}
-    patterns = [f"**/*{ext}" for ext in extensions]
-    file_paths = set()
-    for pattern in patterns:
-        file_paths.update(search_root.glob(pattern))
-
-    for file_path in sorted(file_paths):
-        if not file_path.is_file():
-            continue
-        for module_name, module_def in parse_modules_from_file(file_path).items():
-            if module_name in module_defs:
-                raise VerilogAnalysisError(
-                    f"Module '{module_name}' is defined in both '{module_defs[module_name].file_path}' and '{file_path}'"
-                )
-            module_defs[module_name] = module_def
-    return module_defs
-
-
-def get_target_top_module(top_file: Path, top_module_name: Optional[str]) -> ModuleDef:
-    modules = parse_modules_from_file(top_file)
-    if not modules:
-        raise VerilogAnalysisError(f"No module definition found in '{top_file}'")
-    if top_module_name:
-        if top_module_name not in modules:
-            raise VerilogAnalysisError(f"Top module '{top_module_name}' not found in '{top_file}'")
-        return modules[top_module_name]
-    if len(modules) > 1:
-        raise VerilogAnalysisError(
-            f"Multiple modules found in '{top_file}'. Please specify --top-module. Candidates: {', '.join(sorted(modules))}"
-        )
-    return next(iter(modules.values()))
-
-
-def extract_signal_name(expr: str) -> Optional[str]:
-    expr = expr.strip()
-    if not expr:
-        return None
-    if LITERAL_RE.match(expr):
-        return None
-    signal_match = SIGNAL_REF_RE.match(expr)
-    if signal_match:
-        return signal_match.group(1)
-    if IDENT_RE.match(expr):
-        return expr
-    raise VerilogAnalysisError(
-        f"Unsupported connection expression '{expr}'. Only simple net names or constants are supported."
-    )
-
-
 def parse_instances(top_module: ModuleDef, module_library: Dict[str, ModuleDef]) -> List[InstancePortRef]:
     refs: List[InstancePortRef] = []
-    body_without_comments = strip_comments_preserve_layout(top_module.body)
-    for match in INSTANCE_RE.finditer(body_without_comments):
-        submodule_name = match.group(1)
-        instance_name = match.group(3)
-        connections_text = match.group(4)
+    for instance in parse_module_instances(top_module.body):
+        submodule_name = instance.module_name
+        instance_name = instance.instance_name
 
         if submodule_name not in module_library:
             raise VerilogAnalysisError(
@@ -268,12 +62,13 @@ def parse_instances(top_module: ModuleDef, module_library: Dict[str, ModuleDef])
             )
         submodule_def = module_library[submodule_name]
 
-        for port_name, expr in PORT_CONNECTION_RE.findall(connections_text):
+        for connection in instance.connections:
+            port_name = connection.port_name
             if port_name not in submodule_def.ports:
                 raise VerilogAnalysisError(
                     f"Port '{port_name}' on instance '{instance_name}' was not found in module '{submodule_name}'."
                 )
-            signal_name = extract_signal_name(expr)
+            signal_name = extract_base_signal_name(connection.expr)
             if signal_name is None:
                 continue
             port_def = submodule_def.ports[port_name]
@@ -375,16 +170,6 @@ def analyze_signals(refs: Sequence[InstancePortRef]) -> Tuple[List[SignalAnalysi
     return top_ports, potential_outputs
 
 
-def format_port_decl(direction: str, width: str, signal_name: str) -> str:
-    if width:
-        return f"{direction} {width} {signal_name}"
-    return f"{direction} {signal_name}"
-
-
-def indent_block(text: str, indent: str = "    ") -> str:
-    return "\n".join(f"{indent}{line}" if line.strip() else "" for line in text.splitlines())
-
-
 def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]) -> str:
     port_lines = [format_port_decl(port.top_direction or "wire", port.width, port.signal_name) for port in top_ports]
     if module_def.parameters:
@@ -446,11 +231,9 @@ def print_report(
 
 def write_top_module(top_module: ModuleDef, top_ports: Sequence[SignalAnalysis]) -> None:
     source_text = top_module.file_path.read_text(encoding="utf-8")
-    start, end = top_module.span
     updated_module = format_top_module(top_module, top_ports)
-    updated_text = source_text[:start] + updated_module + source_text[end:]
-    if not updated_text.endswith("\n"):
-        updated_text += "\n"
+    updated_text = replace_span(source_text, top_module.span, updated_module)
+    updated_text = ensure_trailing_newline(updated_text)
     top_module.file_path.write_text(updated_text, encoding="utf-8")
 
 
@@ -465,13 +248,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--search-root",
-        default=".",
-        help="Project root used to search for instantiated module definitions. Default: current directory.",
+        action="append",
+        default=[],
+        help="Project root used to search for instantiated module definitions. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--filelist",
+        action="append",
+        default=[],
+        help="Verilog filelist to load module sources from. Supports nested -f/-F filelists.",
     )
     parser.add_argument(
         "--extensions",
         nargs="+",
-        default=[".v", ".sv", ".vh", ".svh"],
+        default=list(DEFAULT_VERILOG_EXTENSIONS),
         help="File extensions to scan for module definitions.",
     )
     parser.add_argument(
@@ -487,15 +277,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     top_file = Path(args.top_file).resolve()
-    search_root = Path(args.search_root).resolve()
+    filelists = [Path(filelist).resolve() for filelist in args.filelist]
+    search_roots = [Path(search_root).resolve() for search_root in args.search_root]
+    if not search_roots and not filelists:
+        search_roots = [Path(".").resolve()]
 
     if not top_file.is_file():
         parser.error(f"Top file does not exist: {top_file}")
-    if not search_root.is_dir():
-        parser.error(f"Search root is not a directory: {search_root}")
+    for search_root in search_roots:
+        if not search_root.is_dir():
+            parser.error(f"Search root is not a directory: {search_root}")
+    for filelist in filelists:
+        if not filelist.is_file():
+            parser.error(f"Filelist does not exist: {filelist}")
 
     try:
-        module_library = load_module_library(search_root, args.extensions)
+        module_library = load_module_library(search_roots, args.extensions, filelists=filelists)
         top_module = get_target_top_module(top_file, args.top_module)
         refs = parse_instances(top_module, module_library)
         top_ports, potential_outputs = analyze_signals(refs)
