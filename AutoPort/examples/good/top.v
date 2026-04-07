@@ -4,7 +4,7 @@ module top_example (
   mod_a u_a (
     .clk(sys_clk),
     .cfg(cfg[2:0]),
-    .mid(mid),
+    .mid(mid), /* .a(a) */
     .data_out(data_out),
     // .line_comment_test (line_comment_test),
     /* .multi_line_comment_test (multi_line_comment_test) */
