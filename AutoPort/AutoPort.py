@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Generate top-module port definitions from instantiated Verilog modules."""
 
-# TODO.1：识别已有的顶层端口并保留它们（如果它们与实例连接兼容）。这将允许增量迁移而不是一次性重构。
-# TODO.2：如果当前信号已在top module内被wire/reg声明，则将其保留为内部信号而不是提升为端口。这将允许更灵活的重构，而不仅仅是将所有连接提升为端口。
-
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # Allow direct execution via `python3 AutoPort/AutoPort.py ...` by making the
 # repository root importable before loading shared helpers from `utils`.
@@ -27,8 +25,19 @@ from utils.VerilogUtils import (
     format_port_decl,
     get_target_top_module,
     load_module_library,
+    normalize_decl_names,
     parse_module_instances,
+    strip_comments,
 )
+
+INTERNAL_SIGNAL_DECL_RE = re.compile(
+    r"\b(?:wire|reg|logic|tri|wand|wor|uwire)\b\s*"
+    r"(?:signed|unsigned|\s)*"
+    r"(\[[^\]]+\])?\s*"
+    r"([^;]+?)\s*;",
+    re.S,
+)
+FORCE_OUTPUT_SPEC_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\.([A-Za-z_][A-Za-z0-9_$]*)$")
 
 
 @dataclass
@@ -95,79 +104,181 @@ def ensure_same_width(signal_name: str, refs: Sequence[InstancePortRef]) -> str:
     return next(iter(widths), "")
 
 
-def analyze_signals(refs: Sequence[InstancePortRef]) -> Tuple[List[SignalAnalysis], List[SignalAnalysis]]:
+def parse_internal_signal_names(top_module: ModuleDef) -> Set[str]:
+    declared_signals: Set[str] = set()
+    body_clean = strip_comments(top_module.body)
+    for _width, names_text in INTERNAL_SIGNAL_DECL_RE.findall(body_clean):
+        declared_signals.update(normalize_decl_names(names_text))
+    return declared_signals
+
+
+def load_force_output_specs(
+    spec_files: Sequence[Path],
+    module_library: Dict[str, ModuleDef],
+) -> Set[Tuple[str, str]]:
+    forced_specs: Set[Tuple[str, str]] = set()
+    for spec_file in spec_files:
+        for line_no, raw_line in enumerate(spec_file.read_text(encoding="utf-8").splitlines(), start=1):
+            stripped = raw_line.split("//", 1)[0].split("#", 1)[0].strip()
+            if not stripped:
+                continue
+
+            match = FORCE_OUTPUT_SPEC_RE.fullmatch(stripped)
+            if not match:
+                raise VerilogAnalysisError(
+                    f"Invalid force-output entry '{stripped}' in '{spec_file}' line {line_no}. "
+                    "Expected format: module_name.port_name"
+                )
+
+            module_name, port_name = match.groups()
+            if module_name not in module_library:
+                raise VerilogAnalysisError(
+                    f"Module '{module_name}' referenced by '{spec_file}' line {line_no} was not found."
+                )
+            port_def = module_library[module_name].ports.get(port_name)
+            if port_def is None:
+                raise VerilogAnalysisError(
+                    f"Port '{port_name}' on module '{module_name}' referenced by '{spec_file}' line {line_no} was not found."
+                )
+            if port_def.direction != "output":
+                raise VerilogAnalysisError(
+                    f"Only output ports can be forced. '{module_name}.{port_name}' is '{port_def.direction}'."
+                )
+            forced_specs.add((module_name, port_name))
+    return forced_specs
+
+
+def infer_default_top_direction(signal_name: str, refs: Sequence[InstancePortRef]) -> Tuple[Optional[str], str]:
+    directions = {ref.direction for ref in refs}
+
+    if len(refs) == 1:
+        return refs[0].direction, "single connection"
+
+    if directions == {"input"}:
+        return "input", "common input"
+
+    if directions == {"output"}:
+        detail = ", ".join(f"{ref.instance_name}.{ref.port_name}" for ref in refs)
+        raise VerilogAnalysisError(f"Signal '{signal_name}' is driven by multiple output ports only: {detail}")
+
+    if directions == {"inout"} or "inout" in directions:
+        return "inout", "contains inout connection"
+
+    if directions.issubset({"input", "output"}):
+        return None, "internal connection with both input and output endpoints"
+
+    raise VerilogAnalysisError(
+        f"Unsupported direction combination on signal '{signal_name}': {', '.join(sorted(directions))}"
+    )
+
+
+def infer_preserved_port_direction(refs: Sequence[InstancePortRef]) -> str:
+    directions = {ref.direction for ref in refs}
+    if directions == {"inout"} or "inout" in directions:
+        return "inout"
+    if "output" in directions:
+        return "output"
+    return "input"
+
+
+def order_top_ports(
+    top_ports_by_name: Dict[str, SignalAnalysis],
+    existing_ports: Dict[str, object],
+    preserve_existing: bool,
+) -> List[SignalAnalysis]:
+    if not preserve_existing:
+        return [top_ports_by_name[name] for name in sorted(top_ports_by_name)]
+
+    ordered_ports: List[SignalAnalysis] = []
+    remaining = dict(top_ports_by_name)
+    for signal_name in existing_ports:
+        if signal_name in remaining:
+            ordered_ports.append(remaining.pop(signal_name))
+    for signal_name in sorted(remaining):
+        ordered_ports.append(remaining[signal_name])
+    return ordered_ports
+
+
+def analyze_signals(
+    refs: Sequence[InstancePortRef],
+    existing_ports: Dict[str, object],
+    preserve_existing: bool,
+    internal_signal_names: Set[str],
+    forced_output_specs: Set[Tuple[str, str]],
+) -> Tuple[List[SignalAnalysis], List[SignalAnalysis]]:
     by_signal: Dict[str, List[InstancePortRef]] = defaultdict(list)
     for ref in refs:
         by_signal[ref.signal_name].append(ref)
 
-    top_ports: List[SignalAnalysis] = []
-    potential_outputs: List[SignalAnalysis] = []
+    top_ports_by_name: Dict[str, SignalAnalysis] = {}
+    internal_signals: List[SignalAnalysis] = []
 
     for signal_name in sorted(by_signal):
         signal_refs = by_signal[signal_name]
         width = ensure_same_width(signal_name, signal_refs)
-        directions = {ref.direction for ref in signal_refs}
+        default_direction, default_reason = infer_default_top_direction(signal_name, signal_refs)
+        forced_refs = [
+            ref for ref in signal_refs if (ref.module_name, ref.port_name) in forced_output_specs
+        ]
 
-        if len(signal_refs) == 1:
-            only_ref = signal_refs[0]
-            top_ports.append(
-                SignalAnalysis(
-                    signal_name=signal_name,
-                    top_direction=only_ref.direction,
-                    width=width,
-                    reason="single connection",
-                    refs=signal_refs,
+        if forced_refs:
+            directions = {ref.direction for ref in signal_refs}
+            if "inout" in directions:
+                raise VerilogAnalysisError(
+                    f"Signal '{signal_name}' cannot be forced to output because it also connects to inout ports."
                 )
+            top_ports_by_name[signal_name] = SignalAnalysis(
+                signal_name=signal_name,
+                top_direction="output",
+                width=width,
+                reason="forced as top output via force-output list",
+                refs=signal_refs,
             )
             continue
 
-        if directions == {"input"}:
-            top_ports.append(
-                SignalAnalysis(
-                    signal_name=signal_name,
-                    top_direction="input",
-                    width=width,
-                    reason="common input",
-                    refs=signal_refs,
-                )
+        if preserve_existing and signal_name in existing_ports:
+            top_ports_by_name[signal_name] = SignalAnalysis(
+                signal_name=signal_name,
+                top_direction=infer_preserved_port_direction(signal_refs),
+                width=width,
+                reason="preserved existing top port and normalized its direction/width",
+                refs=signal_refs,
             )
             continue
 
-        if directions == {"output"}:
-            detail = ", ".join(f"{ref.instance_name}.{ref.port_name}" for ref in signal_refs)
-            raise VerilogAnalysisError(
-                f"Signal '{signal_name}' is driven by multiple output ports only: {detail}"
-            )
-
-        if directions.issubset({"input", "output"}):
-            potential_outputs.append(
+        if signal_name in internal_signal_names:
+            internal_signals.append(
                 SignalAnalysis(
                     signal_name=signal_name,
                     top_direction=None,
                     width=width,
-                    reason="internal connection with both input and output endpoints",
+                    reason="kept internal because it is already declared in the top module",
                     refs=signal_refs,
                 )
             )
             continue
 
-        if directions == {"inout"} or "inout" in directions:
-            top_ports.append(
+        if default_direction is None:
+            internal_signals.append(
                 SignalAnalysis(
                     signal_name=signal_name,
-                    top_direction="inout",
+                    top_direction=None,
                     width=width,
-                    reason="contains inout connection",
+                    reason=default_reason,
                     refs=signal_refs,
                 )
             )
             continue
 
-        raise VerilogAnalysisError(
-            f"Unsupported direction combination on signal '{signal_name}': {', '.join(sorted(directions))}"
+        top_ports_by_name[signal_name] = SignalAnalysis(
+            signal_name=signal_name,
+            top_direction=default_direction,
+            width=width,
+            reason=default_reason,
+            refs=signal_refs,
         )
 
-    return top_ports, potential_outputs
+    return order_top_ports(top_ports_by_name, existing_ports, preserve_existing), internal_signals
 
 
 def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]) -> str:
@@ -198,7 +309,7 @@ def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]
 def print_report(
     top_module: ModuleDef,
     top_ports: Sequence[SignalAnalysis],
-    potential_outputs: Sequence[SignalAnalysis],
+    internal_signals: Sequence[SignalAnalysis],
     show_refs: bool,
 ) -> None:
     print(f"Updated top module '{top_module.name}' in '{top_module.file_path}'")
@@ -216,10 +327,10 @@ def print_report(
                 )
 
     print()
-    print("=== Potential Internal Outputs ===")
-    if not potential_outputs:
+    print("=== Internal Signals ===")
+    if not internal_signals:
         print("(none)")
-    for signal in potential_outputs:
+    for signal in internal_signals:
         print(f"{signal.signal_name}    // {signal.reason}")
         if show_refs:
             for ref in signal.refs:
@@ -265,6 +376,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="File extensions to scan for module definitions.",
     )
     parser.add_argument(
+        "--port-list-mode",
+        choices=("replace", "preserve"),
+        default="replace",
+        help=(
+            "Port regeneration strategy: 'replace' rebuilds the top port list from scratch; "
+            "'preserve' keeps connected existing top ports and normalizes their direction/width."
+        ),
+    )
+    parser.add_argument(
+        "--force-output-list",
+        action="append",
+        default=[],
+        help=(
+            "Text file containing module_name.port_name entries. Matching output ports are forced "
+            "to become top-module outputs. Can be specified multiple times."
+        ),
+    )
+    parser.add_argument(
         "--show-refs",
         action="store_true",
         help="Print which instance ports contributed to each result.",
@@ -278,6 +407,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     top_file = Path(args.top_file).resolve()
     filelists = [Path(filelist).resolve() for filelist in args.filelist]
+    force_output_lists = [Path(path).resolve() for path in args.force_output_list]
     search_roots = [Path(search_root).resolve() for search_root in args.search_root]
     if not search_roots and not filelists:
         search_roots = [Path(".").resolve()]
@@ -290,18 +420,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for filelist in filelists:
         if not filelist.is_file():
             parser.error(f"Filelist does not exist: {filelist}")
+    for spec_file in force_output_lists:
+        if not spec_file.is_file():
+            parser.error(f"Force-output list does not exist: {spec_file}")
 
     try:
         module_library = load_module_library(search_roots, args.extensions, filelists=filelists)
         top_module = get_target_top_module(top_file, args.top_module)
         refs = parse_instances(top_module, module_library)
-        top_ports, potential_outputs = analyze_signals(refs)
+        forced_output_specs = load_force_output_specs(force_output_lists, module_library)
+        top_ports, internal_signals = analyze_signals(
+            refs=refs,
+            existing_ports=top_module.ports,
+            preserve_existing=args.port_list_mode == "preserve",
+            internal_signal_names=parse_internal_signal_names(top_module),
+            forced_output_specs=forced_output_specs,
+        )
     except VerilogAnalysisError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     write_top_module(top_module, top_ports)
-    print_report(top_module, top_ports, potential_outputs, args.show_refs)
+    print_report(top_module, top_ports, internal_signals, args.show_refs)
     return 0
 
 

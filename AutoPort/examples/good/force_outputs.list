@@ -1,0 +1,2 @@
+# Force one mixed-direction internal signal to become a top-level output.
+mod_a.mid
