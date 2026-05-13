@@ -1,11 +1,4 @@
 module top_force_output_example (
-    input [2:0] cfg,
-    input clk,
-    input data_in,
-    output data_out,
-    output flag,
-    output [7:0] mid,
-    input sys_clk
 );
 
   mod_a u_a (

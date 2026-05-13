@@ -8,6 +8,7 @@ import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -28,6 +29,7 @@ from utils.VerilogUtils import (
     normalize_decl_names,
     parse_module_instances,
     strip_comments,
+    strip_comments_preserve_layout,
 )
 
 INTERNAL_SIGNAL_DECL_RE = re.compile(
@@ -38,6 +40,22 @@ INTERNAL_SIGNAL_DECL_RE = re.compile(
     re.S,
 )
 FORCE_OUTPUT_SPEC_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\.([A-Za-z_][A-Za-z0-9_$]*)$")
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+@dataclass
+class HeaderPortLine:
+    name: str
+    start: int
+    end: int
+    text: str
+
+
+@dataclass
+class IncrementalUpdateSummary:
+    preserved_ports: List[str]
+    added_ports: List[str]
+    deleted_ports: List[str]
 
 
 @dataclass
@@ -172,37 +190,8 @@ def infer_default_top_direction(signal_name: str, refs: Sequence[InstancePortRef
     )
 
 
-def infer_preserved_port_direction(refs: Sequence[InstancePortRef]) -> str:
-    directions = {ref.direction for ref in refs}
-    if directions == {"inout"} or "inout" in directions:
-        return "inout"
-    if "output" in directions:
-        return "output"
-    return "input"
-
-
-def order_top_ports(
-    top_ports_by_name: Dict[str, SignalAnalysis],
-    existing_ports: Dict[str, object],
-    preserve_existing: bool,
-) -> List[SignalAnalysis]:
-    if not preserve_existing:
-        return [top_ports_by_name[name] for name in sorted(top_ports_by_name)]
-
-    ordered_ports: List[SignalAnalysis] = []
-    remaining = dict(top_ports_by_name)
-    for signal_name in existing_ports:
-        if signal_name in remaining:
-            ordered_ports.append(remaining.pop(signal_name))
-    for signal_name in sorted(remaining):
-        ordered_ports.append(remaining[signal_name])
-    return ordered_ports
-
-
 def analyze_signals(
     refs: Sequence[InstancePortRef],
-    existing_ports: Dict[str, object],
-    preserve_existing: bool,
     internal_signal_names: Set[str],
     forced_output_specs: Set[Tuple[str, str]],
 ) -> Tuple[List[SignalAnalysis], List[SignalAnalysis]]:
@@ -232,16 +221,6 @@ def analyze_signals(
                 top_direction="output",
                 width=width,
                 reason="forced as top output via force-output list",
-                refs=signal_refs,
-            )
-            continue
-
-        if preserve_existing and signal_name in existing_ports:
-            top_ports_by_name[signal_name] = SignalAnalysis(
-                signal_name=signal_name,
-                top_direction=infer_preserved_port_direction(signal_refs),
-                width=width,
-                reason="preserved existing top port and normalized its direction/width",
                 refs=signal_refs,
             )
             continue
@@ -278,7 +257,7 @@ def analyze_signals(
             refs=signal_refs,
         )
 
-    return order_top_ports(top_ports_by_name, existing_ports, preserve_existing), internal_signals
+    return [top_ports_by_name[name] for name in sorted(top_ports_by_name)], internal_signals
 
 
 def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]) -> str:
@@ -306,13 +285,240 @@ def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]
     return "\n".join(header_lines) + "\n\nendmodule"
 
 
+def skip_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise VerilogAnalysisError("Could not find matching ')' in module header.")
+
+
+def locate_header_port_list(source_text: str, module_def: ModuleDef) -> Tuple[int, int]:
+    clean_text = strip_comments_preserve_layout(source_text)
+    module_start, module_end = module_def.span
+    module_text = clean_text[module_start:module_end]
+    module_match = re.search(r"\bmodule\s+" + re.escape(module_def.name) + r"\b", module_text)
+    if not module_match:
+        raise VerilogAnalysisError(f"Could not locate module header for '{module_def.name}'.")
+
+    index = module_start + module_match.end()
+    index = skip_whitespace(clean_text, index)
+    if index < module_end and clean_text[index] == "#":
+        index = skip_whitespace(clean_text, index + 1)
+        if index >= module_end or clean_text[index] != "(":
+            raise VerilogAnalysisError(f"Unsupported parameter list syntax in module '{module_def.name}'.")
+        index = find_matching_paren(clean_text, index) + 1
+        index = skip_whitespace(clean_text, index)
+
+    if index >= module_end or clean_text[index] != "(":
+        raise VerilogAnalysisError(f"Could not locate port list in module '{module_def.name}'.")
+
+    close_index = find_matching_paren(clean_text, index)
+    return index + 1, close_index
+
+
+def iter_line_spans(text: str, start: int, end: int) -> List[Tuple[int, int, str]]:
+    lines: List[Tuple[int, int, str]] = []
+    index = start
+    while index < end:
+        newline_index = text.find("\n", index, end)
+        line_end = end if newline_index == -1 else newline_index + 1
+        lines.append((index, line_end, text[index:line_end]))
+        index = line_end
+    return lines
+
+
+def parse_header_port_name(line_text: str) -> Optional[str]:
+    stripped = line_text.lstrip()
+    if not stripped or stripped.startswith("//"):
+        return None
+
+    clean_line = strip_comments(line_text).strip()
+    if not clean_line:
+        return None
+
+    clean_line = clean_line.rstrip(",").strip()
+    if not clean_line:
+        return None
+
+    name_match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)\s*$", clean_line)
+    if not name_match:
+        return None
+    name = name_match.group(1)
+    if not IDENT_RE.match(name):
+        return None
+    return name
+
+
+def parse_header_port_lines(source_text: str, content_start: int, content_end: int) -> List[HeaderPortLine]:
+    port_lines: List[HeaderPortLine] = []
+    for line_start, line_end, line_text in iter_line_spans(source_text, content_start, content_end):
+        port_name = parse_header_port_name(line_text)
+        if port_name:
+            port_lines.append(HeaderPortLine(name=port_name, start=line_start, end=line_end, text=line_text))
+    return port_lines
+
+
+def split_line_ending(line_text: str) -> Tuple[str, str]:
+    if line_text.endswith("\r\n"):
+        return line_text[:-2], "\r\n"
+    if line_text.endswith("\n"):
+        return line_text[:-1], "\n"
+    return line_text, ""
+
+
+def comment_deleted_port_line(line_text: str, timestamp: str) -> str:
+    body, newline = split_line_ending(line_text)
+    indent_match = re.match(r"^(\s*)", body)
+    indent = indent_match.group(1) if indent_match else ""
+    content = body[len(indent):].rstrip()
+    if not content:
+        return line_text
+    return f"{indent}// {content} // delete {timestamp}{newline}"
+
+
+def has_trailing_comma(line_text: str) -> bool:
+    clean_line = strip_comments(line_text).rstrip()
+    return clean_line.endswith(",")
+
+
+def set_trailing_comma(line_text: str, should_have_comma: bool) -> str:
+    if has_trailing_comma(line_text) == should_have_comma:
+        return line_text
+
+    body, newline = split_line_ending(line_text)
+    comment_index = body.find("//")
+    code = body if comment_index == -1 else body[:comment_index]
+    comment = "" if comment_index == -1 else body[comment_index:]
+
+    if should_have_comma:
+        updated_code = code.rstrip() + ","
+        spacing = "" if not comment else " "
+        return f"{updated_code}{spacing}{comment}{newline}"
+
+    updated_code = re.sub(r",\s*$", "", code.rstrip())
+    spacing = "" if not comment else " "
+    return f"{updated_code}{spacing}{comment}{newline}"
+
+
+def infer_port_indent(existing_ports: Sequence[HeaderPortLine], source_text: str, content_start: int) -> str:
+    for port in existing_ports:
+        indent_match = re.match(r"^(\s*)", port.text)
+        if indent_match and port.text.strip():
+            return indent_match.group(1)
+
+    line_start = source_text.rfind("\n", 0, content_start)
+    module_indent = ""
+    if line_start != -1:
+        header_line = source_text[line_start + 1 : content_start]
+        module_indent_match = re.match(r"^(\s*)", header_line)
+        module_indent = module_indent_match.group(1) if module_indent_match else ""
+    return module_indent + "    "
+
+
+def build_autoport_block(new_ports: Sequence[SignalAnalysis], indent: str, timestamp: str) -> str:
+    lines = [f"{indent}/* autoport new {timestamp} begin */"]
+    for index, port in enumerate(new_ports):
+        suffix = "," if index < len(new_ports) - 1 else ""
+        lines.append(f"{indent}{format_port_decl(port.top_direction or 'wire', port.width, port.signal_name)}{suffix}")
+    lines.append(f"{indent}/* autoport new {timestamp} end */")
+    return "\n".join(lines) + "\n"
+
+
+def patch_top_module_incremental(
+    top_module: ModuleDef,
+    top_ports: Sequence[SignalAnalysis],
+    refs: Sequence[InstancePortRef],
+) -> IncrementalUpdateSummary:
+    source_text = top_module.file_path.read_text(encoding="utf-8")
+    content_start, content_end = locate_header_port_list(source_text, top_module)
+    existing_ports = parse_header_port_lines(source_text, content_start, content_end)
+    existing_names = {port.name for port in existing_ports}
+    connected_names = {ref.signal_name for ref in refs}
+    ports_to_add = [port for port in top_ports if port.signal_name not in existing_names]
+    ports_to_delete = [port for port in existing_ports if port.name not in connected_names]
+    preserved_names = [
+        port.name
+        for port in existing_ports
+        if port.name in connected_names and port not in ports_to_delete
+    ]
+    deleted_names = [port.name for port in ports_to_delete]
+    timestamp = datetime.now().strftime("%Y%m%d")
+
+    replacements: Dict[Tuple[int, int], str] = {}
+    deleted_spans = {(port.start, port.end) for port in ports_to_delete}
+    for port in ports_to_delete:
+        replacements[(port.start, port.end)] = comment_deleted_port_line(port.text, timestamp)
+
+    active_ports = [port for port in existing_ports if (port.start, port.end) not in deleted_spans]
+    if active_ports:
+        last_active = active_ports[-1]
+        current_text = replacements.get((last_active.start, last_active.end), last_active.text)
+        replacements[(last_active.start, last_active.end)] = set_trailing_comma(
+            current_text,
+            should_have_comma=bool(ports_to_add),
+        )
+
+    updated_parts: List[str] = []
+    cursor = content_start
+    for (start, end), replacement in sorted(replacements.items()):
+        updated_parts.append(source_text[cursor:start])
+        updated_parts.append(replacement)
+        cursor = end
+    updated_parts.append(source_text[cursor:content_end])
+    updated_content = "".join(updated_parts)
+
+    if ports_to_add:
+        indent = infer_port_indent(existing_ports, source_text, content_start)
+        if not updated_content.endswith("\n"):
+            updated_content += "\n"
+        updated_content += build_autoport_block(ports_to_add, indent, timestamp)
+    elif not active_ports:
+        updated_content = re.sub(r",\s*$", "", updated_content.rstrip()) + ("\n" if updated_content.strip() else "")
+
+    updated_text = source_text[:content_start] + updated_content + source_text[content_end:]
+    updated_text = ensure_trailing_newline(updated_text)
+    top_module.file_path.write_text(updated_text, encoding="utf-8")
+
+    return IncrementalUpdateSummary(
+        preserved_ports=preserved_names,
+        added_ports=[port.signal_name for port in ports_to_add],
+        deleted_ports=deleted_names,
+    )
+
+
 def print_report(
     top_module: ModuleDef,
     top_ports: Sequence[SignalAnalysis],
     internal_signals: Sequence[SignalAnalysis],
     show_refs: bool,
+    incremental_summary: Optional[IncrementalUpdateSummary] = None,
 ) -> None:
     print(f"Updated top module '{top_module.name}' in '{top_module.file_path}'")
+    if incremental_summary is not None:
+        print()
+        print("=== Incremental Update Summary ===")
+        preserved = (
+            ", ".join(incremental_summary.preserved_ports)
+            if incremental_summary.preserved_ports
+            else "(none)"
+        )
+        added = ", ".join(incremental_summary.added_ports) if incremental_summary.added_ports else "(none)"
+        deleted = ", ".join(incremental_summary.deleted_ports) if incremental_summary.deleted_ports else "(none)"
+        print(f"Preserved existing ports: {preserved}")
+        print(f"Added ports: {added}")
+        print(f"Commented deleted ports: {deleted}")
     print()
     print("=== Port Summary ===")
     if not top_ports:
@@ -377,11 +583,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port-list-mode",
-        choices=("replace", "preserve"),
+        choices=("replace", "incremental"),
         default="replace",
         help=(
-            "Port regeneration strategy: 'replace' rebuilds the top port list from scratch; "
-            "'preserve' keeps connected existing top ports and normalizes their direction/width."
+            "Port update strategy: 'replace' rebuilds the whole top port list; "
+            "'incremental' preserves existing header text, appends missing ports, and comments deleted ports."
         ),
     )
     parser.add_argument(
@@ -431,8 +637,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         forced_output_specs = load_force_output_specs(force_output_lists, module_library)
         top_ports, internal_signals = analyze_signals(
             refs=refs,
-            existing_ports=top_module.ports,
-            preserve_existing=args.port_list_mode == "preserve",
             internal_signal_names=parse_internal_signal_names(top_module),
             forced_output_specs=forced_output_specs,
         )
@@ -440,8 +644,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    write_top_module(top_module, top_ports)
-    print_report(top_module, top_ports, internal_signals, args.show_refs)
+    incremental_summary: Optional[IncrementalUpdateSummary] = None
+    if args.port_list_mode == "incremental":
+        incremental_summary = patch_top_module_incremental(top_module, top_ports, refs)
+    else:
+        write_top_module(top_module, top_ports)
+    print_report(top_module, top_ports, internal_signals, args.show_refs, incremental_summary)
     return 0
 
 

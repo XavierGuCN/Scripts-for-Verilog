@@ -1,6 +1,6 @@
-module top_preserve_example (
-  input cfg,
-  output mid,
+module top_incremental_example (
+  input cfg, // kept as-is even though the connected port is [2:0]
+  output [7:0] mid, // manually promoted top output
   input stale_port
 );
 

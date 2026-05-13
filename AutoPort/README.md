@@ -2,10 +2,7 @@
 
 `AutoPort.py` 用来扫描一个 top module 中的例化模块，根据各子模块端口方向和同名连线关系，自动推导 top module 需要暴露的端口，并直接回写到原始 top module 定义中。
 
-它现在支持两种端口生成策略：
-
-- `replace`：删除当前 top 的 port list，并按实例连接结果重新生成。
-- `preserve`：识别并保留已有顶层端口；只要它仍然连接到实例，就会继续保留，同时自动修正方向和位宽；没有任何实例连接的旧端口会被删除。
+脚本默认会删除当前 top 的 port list，并按实例连接结果重新生成。也可以使用增量更新模式，保留已有 header 文本，只追加缺失端口并注释掉明确无效的旧端口。
 
 ## 使用方式
 
@@ -25,7 +22,7 @@ python3 AutoPort.py path/to/top.v \
 - `--top-module`：如果 `top_file` 内有多个 module，需要显式指定 top module 名称。
 - `--search-root`：扫描子模块定义的工程根目录。可重复指定多个目录；如果没有传 `--filelist`，默认扫描当前目录。
 - `--filelist`：按 filelist 收集 Verilog 源文件。支持嵌套 `-f/-F` 子 filelist，也支持常见的 `-v` 源文件和 `-y` 库目录。
-- `--port-list-mode {replace,preserve}`：选择 top port list 生成策略。默认 `replace`。
+- `--port-list-mode {replace,incremental}`：选择 top port list 更新策略。默认 `replace`。
 - `--force-output-list`：指定一份文本列表文件，强制某些 `module_name.port_name` 对应的 `output` 端口继续向当前 top 伸出。可重复指定多份列表。
 - `--show-refs`：额外打印每个结论来自哪些例化端口，便于排查。
 
@@ -48,7 +45,7 @@ python3 AutoPort.py rtl/top.v \
 python3 AutoPort.py rtl/top.v \
   --top-module top_example \
   --search-root ./rtl \
-  --port-list-mode preserve
+  --port-list-mode incremental
 ```
 
 ```bash
@@ -58,16 +55,15 @@ python3 AutoPort.py rtl/top.v \
   --force-output-list ./cfg/force_outputs.list
 ```
 
-执行后脚本会直接覆盖 `top_file` 中的目标 top module，把推导出的端口定义写到 `module ... (...)` 上；终端中会输出 `Port Summary` 与 `Internal Signals` 两段汇总。
+`replace` 模式会直接覆盖 `top_file` 中的目标 top module，把推导出的端口定义写到 `module ... (...)` 上；`incremental` 模式只更新目标 top module 的 header port list。终端中会输出 `Port Summary` 与 `Internal Signals` 两段汇总。
 
 ## 规则实现
 
-- `replace` 模式：
-  - 完全忽略当前 top 里已有的端口定义，按实例连接结果重新生成。
-- `preserve` 模式：
-  - 如果某个顶层已有端口仍然连接到实例，则保留它。
-  - 保留时会自动修正方向和位宽。
-  - 如果某个已有顶层端口已经不再连接任何实例，则会被删除。
+- `replace` 模式完全忽略当前 top 里已有的端口定义，按实例连接结果重新生成。
+- `incremental` 模式保留已有端口的原始顺序、注释和格式。
+- `incremental` 模式只把缺失的新端口追加到已有端口之后，并包在 `/* autoport new YYYYMMDD begin */` 和 `/* autoport new YYYYMMDD end */` 之间。
+- `incremental` 模式会把没有任何实例连接的旧端口视为明确无效端口，整行注释掉，并在行末追加 `// delete YYYYMMDD`。
+- `incremental` 模式不会修正已有端口的方向或位宽；这类不一致留给 lint 检查。
 - 如果某个信号已经在 top module 内被声明为 `wire/reg/logic/tri/wand/wor/uwire`：
   - 默认保留为内部信号，不自动提升为 top port。
 - 如果某个信号命中了 `--force-output-list` 中配置的 `module_name.port_name`：
@@ -82,7 +78,6 @@ python3 AutoPort.py rtl/top.v \
   - 视为错误，脚本直接退出
 - 某个信号连接到多个例化端口，且同时存在 `input` 与 `output`：
   - 默认视为内部互联，不出现在 top 端口中，同时记入 `Internal Signals`
-  - 如果该信号本来就是已有顶层端口且使用 `--port-list-mode preserve`，则保留为 `output`
   - 如果该信号命中 `--force-output-list`，则强制生成为 `output`
 - 某个信号包含 `inout` 连接：
   - top 定义为 `inout`
