@@ -582,12 +582,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="File extensions to scan for module definitions.",
     )
     parser.add_argument(
-        "--port-list-mode",
-        choices=("replace", "incremental"),
-        default="replace",
+        "--mode",
+        choices=("replace", "incr"),
+        default="incr",
         help=(
             "Port update strategy: 'replace' rebuilds the whole top port list; "
-            "'incremental' preserves existing header text, appends missing ports, and comments deleted ports."
+            "'incr' preserves existing header text, appends missing ports, and comments deleted ports."
         ),
     )
     parser.add_argument(
@@ -645,7 +645,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     incremental_summary: Optional[IncrementalUpdateSummary] = None
-    if args.port_list_mode == "incremental":
+    if args.mode == "incr":
         incremental_summary = patch_top_module_incremental(top_module, top_ports, refs)
     else:
         write_top_module(top_module, top_ports)

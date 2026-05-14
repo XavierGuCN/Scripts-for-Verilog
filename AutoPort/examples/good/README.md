@@ -8,6 +8,7 @@
 python3 AutoPort.py examples/good/top.v \
   --top-module top_example \
   --search-root examples/good \
+  --mode replace \
   --show-refs
 ```
 
@@ -36,7 +37,7 @@ python3 AutoPort.py examples/good/top_internal_signal.v \
 python3 AutoPort.py examples/good/top_incremental.v \
   --top-module top_incremental_example \
   --search-root examples/good \
-  --port-list-mode incremental \
+  --mode incr \
   --show-refs
 ```
 

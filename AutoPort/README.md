@@ -2,7 +2,7 @@
 
 `AutoPort.py` 用来扫描一个 top module 中的例化模块，根据各子模块端口方向和同名连线关系，自动推导 top module 需要暴露的端口，并直接回写到原始 top module 定义中。
 
-脚本默认会删除当前 top 的 port list，并按实例连接结果重新生成。也可以使用增量更新模式，保留已有 header 文本，只追加缺失端口并注释掉明确无效的旧端口。
+脚本默认使用增量更新模式，保留已有 header 文本，只追加缺失端口并注释掉明确无效的旧端口。也可以切换到 `replace` 模式，删除当前 top 的 port list 并按实例连接结果重新生成。
 
 ## 使用方式
 
@@ -12,7 +12,6 @@ python3 AutoPort.py path/to/top.v \
   --search-root path/to/project_a \
   --search-root path/to/project_b \
   --filelist path/to/files.f \
-  --port-list-mode replace \
   --show-refs
 ```
 
@@ -22,7 +21,7 @@ python3 AutoPort.py path/to/top.v \
 - `--top-module`：如果 `top_file` 内有多个 module，需要显式指定 top module 名称。
 - `--search-root`：扫描子模块定义的工程根目录。可重复指定多个目录；如果没有传 `--filelist`，默认扫描当前目录。
 - `--filelist`：按 filelist 收集 Verilog 源文件。支持嵌套 `-f/-F` 子 filelist，也支持常见的 `-v` 源文件和 `-y` 库目录。
-- `--port-list-mode {replace,incremental}`：选择 top port list 更新策略。默认 `replace`。
+- `--mode {incr,replace}`：选择 top port list 更新策略。默认 `incr`。
 - `--force-output-list`：指定一份文本列表文件，强制某些 `module_name.port_name` 对应的 `output` 端口继续向当前 top 伸出。可重复指定多份列表。
 - `--show-refs`：额外打印每个结论来自哪些例化端口，便于排查。
 
@@ -44,8 +43,14 @@ python3 AutoPort.py rtl/top.v \
 ```bash
 python3 AutoPort.py rtl/top.v \
   --top-module top_example \
+  --search-root ./rtl
+```
+
+```bash
+python3 AutoPort.py rtl/top.v \
+  --top-module top_example \
   --search-root ./rtl \
-  --port-list-mode incremental
+  --mode replace
 ```
 
 ```bash
@@ -55,15 +60,15 @@ python3 AutoPort.py rtl/top.v \
   --force-output-list ./cfg/force_outputs.list
 ```
 
-`replace` 模式会直接覆盖 `top_file` 中的目标 top module，把推导出的端口定义写到 `module ... (...)` 上；`incremental` 模式只更新目标 top module 的 header port list。终端中会输出 `Port Summary` 与 `Internal Signals` 两段汇总。
+`incr` 模式只更新目标 top module 的 header port list；`replace` 模式会直接覆盖 `top_file` 中的目标 top module，把推导出的端口定义写到 `module ... (...)` 上。终端中会输出 `Port Summary` 与 `Internal Signals` 两段汇总。
 
 ## 规则实现
 
 - `replace` 模式完全忽略当前 top 里已有的端口定义，按实例连接结果重新生成。
-- `incremental` 模式保留已有端口的原始顺序、注释和格式。
-- `incremental` 模式只把缺失的新端口追加到已有端口之后，并包在 `/* autoport new YYYYMMDD begin */` 和 `/* autoport new YYYYMMDD end */` 之间。
-- `incremental` 模式会把没有任何实例连接的旧端口视为明确无效端口，整行注释掉，并在行末追加 `// delete YYYYMMDD`。
-- `incremental` 模式不会修正已有端口的方向或位宽；这类不一致留给 lint 检查。
+- `incr` 模式保留已有端口的原始顺序、注释和格式。
+- `incr` 模式只把缺失的新端口追加到已有端口之后，并包在 `/* autoport new YYYYMMDD begin */` 和 `/* autoport new YYYYMMDD end */` 之间。
+- `incr` 模式会把没有任何实例连接的旧端口视为明确无效端口，整行注释掉，并在行末追加 `// delete YYYYMMDD`。
+- `incr` 模式不会修正已有端口的方向或位宽；这类不一致留给 lint 检查。
 - 如果某个信号已经在 top module 内被声明为 `wire/reg/logic/tri/wand/wor/uwire`：
   - 默认保留为内部信号，不自动提升为 top port。
 - 如果某个信号命中了 `--force-output-list` 中配置的 `module_name.port_name`：
