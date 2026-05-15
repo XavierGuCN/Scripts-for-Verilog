@@ -16,7 +16,6 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.PyUtils import ensure_trailing_newline, indent_block, replace_span
 from utils.VerilogLanguageUtils import (
     InstancePortRef,
     ModuleDef,
@@ -33,7 +32,10 @@ from utils.VerilogLanguageUtils import (
 )
 from utils.VerilogTextUtils import (
     DEFAULT_VERILOG_EXTENSIONS,
+    ensure_trailing_newline,
+    indent_block,
     infer_port_indent,
+    replace_span,
     set_trailing_comma,
     split_line_ending,
 )

@@ -17,10 +17,13 @@ __all__ = [
     "FILELIST_IGNORE_OPTIONS_WITH_ARG",
     "VerilogTextError",
     "collect_verilog_source_files",
+    "ensure_trailing_newline",
     "find_matching_paren",
     "has_trailing_comma",
+    "indent_block",
     "infer_port_indent",
     "iter_line_spans",
+    "replace_span",
     "set_trailing_comma",
     "skip_whitespace",
     "split_line_ending",
@@ -48,6 +51,24 @@ FILELIST_IGNORE_OPTIONS_WITH_ARG = {
 
 class VerilogTextError(Exception):
     """Raised when source text or source-file collection cannot be processed."""
+
+
+def indent_block(text: str, indent: str = "    ") -> str:
+    """Indent every non-empty line in a multi-line string."""
+    return "\n".join(f"{indent}{line}" if line.strip() else "" for line in text.splitlines())
+
+
+def ensure_trailing_newline(text: str) -> str:
+    """Ensure text ends with a newline character."""
+    if text.endswith("\n"):
+        return text
+    return text + "\n"
+
+
+def replace_span(text: str, span: Tuple[int, int], replacement: str) -> str:
+    """Replace a half-open character span ``[start, end)`` inside ``text``."""
+    start, end = span
+    return text[:start] + replacement + text[end:]
 
 
 def _normalize_extensions(extensions: Sequence[str]) -> Tuple[str, ...]:

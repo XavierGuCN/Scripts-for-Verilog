@@ -2,7 +2,7 @@
 
 `PyUtils.py`、`VerilogTextUtils.py` 和 `VerilogLanguageUtils.py` 提供了当前脚本仓库里可复用的基础能力。
 
-- `PyUtils.py`：通用文本/文件处理。
+- `PyUtils.py`：通用 Python/文件处理。
 - `VerilogTextUtils.py`：Verilog 源码文本处理，例如注释、行 span、括号匹配、逗号、缩进、filelist。
 - `VerilogLanguageUtils.py`：Verilog 语法解析和分析，例如端口、模块、实例、信号方向/位宽。
 
@@ -16,6 +16,64 @@
 ## PyUtils.py
 
 文件位置：[PyUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/PyUtils.py)
+
+### collect_files_by_extensions
+
+作用：递归扫描目录，返回所有匹配扩展名的文件路径。
+
+函数签名：
+
+```python
+collect_files_by_extensions(search_root: Path, extensions: Sequence[str]) -> list[Path]
+```
+
+典型用途：
+
+- 收集工程中的 `.v`、`.sv` 文件
+- 为模块库加载提供输入文件列表
+
+示例：
+
+```python
+from pathlib import Path
+from utils.PyUtils import collect_files_by_extensions
+
+paths = collect_files_by_extensions(Path("examples/good"), [".v"])
+for path in paths:
+    print(path.name)
+```
+
+输出：
+
+```text
+mod_a.v
+mod_b.v
+mod_c.v
+top.v
+```
+
+## VerilogTextUtils.py
+
+文件位置：[VerilogTextUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/VerilogTextUtils.py)
+
+职责：处理 Verilog 源码文本和源码文件集合，不直接建模 Verilog module/port/signal 语义。
+
+典型内容：
+
+- `DEFAULT_VERILOG_EXTENSIONS`
+- `collect_verilog_source_files`
+- `indent_block`
+- `ensure_trailing_newline`
+- `replace_span`
+- `strip_comments`
+- `strip_comments_preserve_layout`
+- `split_top_level_csv`
+- `find_matching_paren`
+- `iter_line_spans`
+- `split_line_ending`
+- `has_trailing_comma`
+- `set_trailing_comma`
+- `infer_port_indent`
 
 ### indent_block
 
@@ -36,7 +94,7 @@ indent_block(text: str, indent: str = "    ") -> str
 示例：
 
 ```python
-from PyUtils import indent_block
+from utils.VerilogTextUtils import indent_block
 
 text = "input clk\n\noutput done"
 result = indent_block(text, "  ")
@@ -63,13 +121,13 @@ ensure_trailing_newline(text: str) -> str
 
 典型用途：
 
-- 文件回写前统一结尾格式
-- 避免生成的文本没有尾换行
+- Verilog 文件回写前统一结尾格式
+- 避免生成的源码文本没有尾换行
 
 示例：
 
 ```python
-from PyUtils import ensure_trailing_newline
+from utils.VerilogTextUtils import ensure_trailing_newline
 
 print(repr(ensure_trailing_newline("module top;")))
 print(repr(ensure_trailing_newline("module top;\n")))
@@ -100,7 +158,7 @@ replace_span(text: str, span: tuple[int, int], replacement: str) -> str
 示例：
 
 ```python
-from PyUtils import replace_span
+from utils.VerilogTextUtils import replace_span
 
 text = "abcdef"
 result = replace_span(text, (2, 4), "XY")
@@ -112,61 +170,6 @@ print(result)
 ```text
 abXYef
 ```
-
-### collect_files_by_extensions
-
-作用：递归扫描目录，返回所有匹配扩展名的文件路径。
-
-函数签名：
-
-```python
-collect_files_by_extensions(search_root: Path, extensions: Sequence[str]) -> list[Path]
-```
-
-典型用途：
-
-- 收集工程中的 `.v`、`.sv` 文件
-- 为模块库加载提供输入文件列表
-
-示例：
-
-```python
-from pathlib import Path
-from PyUtils import collect_files_by_extensions
-
-paths = collect_files_by_extensions(Path("examples/good"), [".v"])
-for path in paths:
-    print(path.name)
-```
-
-输出：
-
-```text
-mod_a.v
-mod_b.v
-mod_c.v
-top.v
-```
-
-## VerilogTextUtils.py
-
-文件位置：[VerilogTextUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/VerilogTextUtils.py)
-
-职责：处理 Verilog 源码文本和源码文件集合，不直接建模 Verilog module/port/signal 语义。
-
-典型内容：
-
-- `DEFAULT_VERILOG_EXTENSIONS`
-- `collect_verilog_source_files`
-- `strip_comments`
-- `strip_comments_preserve_layout`
-- `split_top_level_csv`
-- `find_matching_paren`
-- `iter_line_spans`
-- `split_line_ending`
-- `has_trailing_comma`
-- `set_trailing_comma`
-- `infer_port_indent`
 
 ## VerilogLanguageUtils.py
 
