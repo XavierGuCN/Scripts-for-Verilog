@@ -1,6 +1,10 @@
 # Utils Reference
 
-`PyUtils.py` 和 `VerilogUtils.py` 提供了当前脚本仓库里可复用的基础能力。前者偏通用文本/文件处理，后者偏 Verilog 解析与格式化。
+`PyUtils.py`、`VerilogTextUtils.py` 和 `VerilogLanguageUtils.py` 提供了当前脚本仓库里可复用的基础能力。
+
+- `PyUtils.py`：通用文本/文件处理。
+- `VerilogTextUtils.py`：Verilog 源码文本处理，例如注释、行 span、括号匹配、逗号、缩进、filelist。
+- `VerilogLanguageUtils.py`：Verilog 语法解析和分析，例如端口、模块、实例、信号方向/位宽。
 
 本文档包含：
 
@@ -11,7 +15,7 @@
 
 ## PyUtils.py
 
-文件位置：[PyUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/AutoPort/PyUtils.py)
+文件位置：[PyUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/PyUtils.py)
 
 ### indent_block
 
@@ -144,9 +148,59 @@ mod_c.v
 top.v
 ```
 
-## VerilogUtils.py
+## VerilogTextUtils.py
 
-文件位置：[VerilogUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/AutoPort/VerilogUtils.py)
+文件位置：[VerilogTextUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/VerilogTextUtils.py)
+
+职责：处理 Verilog 源码文本和源码文件集合，不直接建模 Verilog module/port/signal 语义。
+
+典型内容：
+
+- `DEFAULT_VERILOG_EXTENSIONS`
+- `collect_verilog_source_files`
+- `strip_comments`
+- `strip_comments_preserve_layout`
+- `split_top_level_csv`
+- `find_matching_paren`
+- `iter_line_spans`
+- `split_line_ending`
+- `has_trailing_comma`
+- `set_trailing_comma`
+- `infer_port_indent`
+
+## VerilogLanguageUtils.py
+
+文件位置：[VerilogLanguageUtils.py](/Users/xaviergu/Library/CloudStorage/OneDrive-个人/0000_Working%20%26%20Study/Scripts%20for%20Verilog/utils/VerilogLanguageUtils.py)
+
+职责：处理 Verilog 语法结构、信号关系和端口分析。
+
+典型内容：
+
+- Verilog regex：`MODULE_RE`、`INSTANCE_RE`、`PORT_CONNECTION_RE`、`DECL_RE`、`IDENT_RE`、`SIGNAL_REF_RE` 等
+- 数据结构：`PortDef`、`ModuleDef`、`NamedConnection`、`InstanceDef`、`HeaderPortLine`、`InstancePortRef`、`SignalAnalysis`
+- 语法解析：`parse_header_ports`、`parse_body_ports`、`parse_module_instances`、`parse_modules_from_file`
+- 信号分析：`parse_instances`、`parse_internal_signal_names`、`ensure_same_width`、`analyze_signals`
+
+### 常量和正则
+
+#### DEFAULT_VERILOG_EXTENSIONS
+
+作用：默认扫描的 Verilog/SystemVerilog 文件扩展名。
+
+当前值：
+
+```python
+(".v", ".sv", ".vh", ".svh")
+```
+
+#### INTERNAL_SIGNAL_DECL_RE
+
+作用：匹配 module body 内部的 `wire`、`reg`、`logic`、`tri` 等信号声明。
+
+典型用途：
+
+- 判断 top module 中某个连接信号是否已经被声明为内部信号
+- 给 AutoPort/AutoWire 类脚本复用内部信号提取逻辑
 
 ### 数据结构
 
@@ -167,7 +221,7 @@ top.v
 示例：
 
 ```python
-from VerilogUtils import PortDef
+from utils.VerilogLanguageUtils import PortDef
 
 port = PortDef(name="data", direction="input", width="[ 7 : 0 ]")
 print(port.width_clean)
@@ -212,6 +266,42 @@ print(port.width_clean)
 - `parameter_overrides`：参数覆盖文本
 - `connections`：命名端口连接列表
 
+#### HeaderPortLine
+
+作用：表示 module header 端口列表中的一行端口文本及其源码位置。
+
+字段：
+
+- `name`：端口名
+- `start`：该行在原始源码中的起始字符位置
+- `end`：该行在原始源码中的结束字符位置
+- `text`：该行原始文本
+
+#### InstancePortRef
+
+作用：表示一个 instance port 已经被解析并绑定到某个上层 signal。
+
+字段：
+
+- `instance_name`：实例名
+- `module_name`：实例所属模块名
+- `port_name`：子模块端口名
+- `signal_name`：连接到的基础信号名
+- `direction`：子模块端口方向
+- `width`：去空白后的端口位宽
+
+#### SignalAnalysis
+
+作用：表示某个 signal 经过方向和位宽分析后的结果。
+
+字段：
+
+- `signal_name`：信号名
+- `top_direction`：推断出的 top 方向；如果为 `None`，表示应保留为内部信号
+- `width`：信号位宽
+- `reason`：推断原因
+- `refs`：贡献该分析结果的 `InstancePortRef` 列表
+
 ### strip_comments
 
 作用：直接移除 Verilog 中的单行和多行注释。
@@ -225,7 +315,7 @@ strip_comments(text: str) -> str
 示例：
 
 ```python
-from VerilogUtils import strip_comments
+from utils.VerilogTextUtils import strip_comments
 
 text = "wire a; // keep line\n/* drop */ wire b;"
 print(strip_comments(text))
@@ -253,7 +343,7 @@ strip_comments_preserve_layout(text: str) -> str
 示例：
 
 ```python
-from VerilogUtils import strip_comments_preserve_layout
+from utils.VerilogTextUtils import strip_comments_preserve_layout
 
 text = "a/*xx*/b // y\nc"
 print(strip_comments_preserve_layout(text))
@@ -279,7 +369,7 @@ normalize_width(width: str) -> str
 示例：
 
 ```python
-from VerilogUtils import normalize_width
+from utils.VerilogLanguageUtils import normalize_width
 
 print(normalize_width("[ 15 : 0 ]"))
 ```
@@ -309,7 +399,7 @@ split_top_level_csv(text: str) -> list[str]
 示例：
 
 ```python
-from VerilogUtils import split_top_level_csv
+from utils.VerilogTextUtils import split_top_level_csv
 
 text = "a, func(x, y), bus[3:0], {m, n}"
 print(split_top_level_csv(text))
@@ -334,7 +424,7 @@ normalize_decl_names(names_text: str) -> list[str]
 示例：
 
 ```python
-from VerilogUtils import normalize_decl_names
+from utils.VerilogLanguageUtils import normalize_decl_names
 
 text = "a, b = 1'b0, cfg[2:0]"
 print(normalize_decl_names(text))
@@ -359,7 +449,7 @@ parse_header_ports(header_text: str) -> dict[str, PortDef]
 示例：
 
 ```python
-from VerilogUtils import parse_header_ports
+from utils.VerilogLanguageUtils import parse_header_ports
 
 ports = parse_header_ports("input clk, output [7:0] data_out")
 for name, port in ports.items():
@@ -386,7 +476,7 @@ parse_body_ports(body_text: str) -> dict[str, PortDef]
 示例：
 
 ```python
-from VerilogUtils import parse_body_ports
+from utils.VerilogLanguageUtils import parse_body_ports
 
 body = """
 input clk;
@@ -418,7 +508,7 @@ parse_named_port_connections(connections_text: str) -> list[NamedConnection]
 示例：
 
 ```python
-from VerilogUtils import parse_named_port_connections
+from utils.VerilogLanguageUtils import parse_named_port_connections
 
 connections = parse_named_port_connections(".clk(sys_clk), .cfg(cfg[2:0])")
 for item in connections:
@@ -445,7 +535,7 @@ parse_module_instances(module_body: str) -> list[InstanceDef]
 示例：
 
 ```python
-from VerilogUtils import parse_module_instances
+from utils.VerilogLanguageUtils import parse_module_instances
 
 body = """
 mod_a u_a (
@@ -465,6 +555,90 @@ for inst in instances:
 mod_a u_a 2
 ```
 
+### parse_instances
+
+作用：解析 top module 中的实例化连接，并结合 module library 把 `.port(signal)` 转换成带方向和位宽的 `InstancePortRef`。
+
+函数签名：
+
+```python
+parse_instances(top_module: ModuleDef, module_library: dict[str, ModuleDef]) -> list[InstancePortRef]
+```
+
+典型用途：
+
+- AutoPort 推断 top 端口
+- AutoWire/AutoReg 分析实例之间的连接关系
+- 检查 instance 端口名是否存在于被例化模块定义中
+
+### ensure_same_width
+
+作用：检查同一个信号连接到的所有端口位宽是否一致，并返回统一位宽。
+
+函数签名：
+
+```python
+ensure_same_width(signal_name: str, refs: Sequence[InstancePortRef]) -> str
+```
+
+如果位宽不一致，会抛出 `VerilogAnalysisError`。
+
+### parse_internal_signal_names
+
+作用：解析 module body 中已经声明的内部信号名。
+
+函数签名：
+
+```python
+parse_internal_signal_names(top_module: ModuleDef) -> set[str]
+```
+
+典型用途：
+
+- AutoPort 判断信号是否应该继续保留为内部信号
+- AutoWire 类脚本避免重复声明已有 wire/logic
+
+### infer_default_top_direction
+
+作用：根据同一信号连接到的 instance port 方向，推断默认 top 方向。
+
+函数签名：
+
+```python
+infer_default_top_direction(
+    signal_name: str,
+    refs: Sequence[InstancePortRef],
+) -> tuple[str | None, str]
+```
+
+基本规则：
+
+- 单连接：沿用该 instance port 方向
+- 全部为 `input`：推断为 top `input`
+- 全部为 `output`：视为多驱动并报错
+- 包含 `inout`：推断为 top `inout`
+- 同时包含 `input` 和 `output`：视为内部连接，返回 `None`
+
+### analyze_signals
+
+作用：汇总 `InstancePortRef`，把信号分类成 top port 或 internal signal。
+
+函数签名：
+
+```python
+analyze_signals(
+    refs: Sequence[InstancePortRef],
+    internal_signal_names: set[str],
+    forced_output_specs: set[tuple[str, str]],
+) -> tuple[list[SignalAnalysis], list[SignalAnalysis]]
+```
+
+典型用途：
+
+- AutoPort 的核心分析步骤
+- 其他脚本复用 top port/internal signal 分类逻辑
+- 配合 `forced_output_specs` 把指定 `module.port` 的 output 强制提升为 top output
+
 ### parse_modules_from_file
 
 作用：从单个 Verilog 文件中解析出所有 module。
@@ -479,7 +653,7 @@ parse_modules_from_file(file_path: Path) -> dict[str, ModuleDef]
 
 ```python
 from pathlib import Path
-from VerilogUtils import parse_modules_from_file
+from utils.VerilogLanguageUtils import parse_modules_from_file
 
 modules = parse_modules_from_file(Path("examples/good/top.v"))
 print(sorted(modules))
@@ -509,7 +683,8 @@ load_module_library(
 
 ```python
 from pathlib import Path
-from VerilogUtils import DEFAULT_VERILOG_EXTENSIONS, load_module_library
+from utils.VerilogLanguageUtils import load_module_library
+from utils.VerilogTextUtils import DEFAULT_VERILOG_EXTENSIONS
 
 library = load_module_library(
     [Path("examples/good")],
@@ -550,7 +725,7 @@ collect_verilog_source_files(
 
 ```python
 from pathlib import Path
-from VerilogUtils import DEFAULT_VERILOG_EXTENSIONS, collect_verilog_source_files
+from utils.VerilogTextUtils import DEFAULT_VERILOG_EXTENSIONS, collect_verilog_source_files
 
 files = collect_verilog_source_files(
     [Path("examples/good")],
@@ -588,7 +763,7 @@ get_target_top_module(top_file: Path, top_module_name: str | None) -> ModuleDef
 
 ```python
 from pathlib import Path
-from VerilogUtils import get_target_top_module
+from utils.VerilogLanguageUtils import get_target_top_module
 
 top = get_target_top_module(Path("examples/good/top.v"), None)
 print(top.name)
@@ -620,7 +795,7 @@ extract_base_signal_name(expr: str) -> str | None
 示例：
 
 ```python
-from VerilogUtils import extract_base_signal_name
+from utils.VerilogLanguageUtils import extract_base_signal_name
 
 print(extract_base_signal_name("cfg[2:0]"))
 print(extract_base_signal_name("1'b0"))
@@ -631,6 +806,120 @@ print(extract_base_signal_name("1'b0"))
 ```text
 cfg
 None
+```
+
+### find_matching_paren
+
+作用：从指定的左括号位置开始，找到与之匹配的右括号位置。
+
+函数签名：
+
+```python
+find_matching_paren(text: str, open_index: int) -> int
+```
+
+典型用途：
+
+- 定位 module 参数列表或端口列表边界
+- 在简单源码扫描中处理嵌套括号
+
+### locate_header_port_list
+
+作用：定位 module header 中端口列表内容的字符区间。
+
+函数签名：
+
+```python
+locate_header_port_list(source_text: str, module_def: ModuleDef) -> tuple[int, int]
+```
+
+返回值是半开区间 `[start, end)`，不包含外层 `(` 和 `)`。
+
+### iter_line_spans
+
+作用：把指定文本区间按行切分，并保留每行在原始字符串中的字符区间。
+
+函数签名：
+
+```python
+iter_line_spans(text: str, start: int, end: int) -> list[tuple[int, int, str]]
+```
+
+### parse_header_port_name
+
+作用：从 module header 的一行文本中提取端口名。
+
+函数签名：
+
+```python
+parse_header_port_name(line_text: str) -> str | None
+```
+
+说明：该函数适合一行一个端口的常见 header 风格；复杂宏或一行多个端口可能无法准确表达。
+
+### parse_header_port_lines
+
+作用：解析 module header 端口列表区间内可识别的端口行。
+
+函数签名：
+
+```python
+parse_header_port_lines(
+    source_text: str,
+    content_start: int,
+    content_end: int,
+) -> list[HeaderPortLine]
+```
+
+典型用途：
+
+- 增量更新 module header
+- 保留原始端口行文本、注释和字符位置
+
+### split_line_ending
+
+作用：把一行文本拆成正文和换行符。
+
+函数签名：
+
+```python
+split_line_ending(line_text: str) -> tuple[str, str]
+```
+
+支持 `\n` 和 `\r\n`。
+
+### has_trailing_comma
+
+作用：判断一行代码部分是否以逗号结尾，行尾注释会被忽略。
+
+函数签名：
+
+```python
+has_trailing_comma(line_text: str) -> bool
+```
+
+### set_trailing_comma
+
+作用：给一行端口文本添加或移除末尾逗号，同时尽量保留行尾注释。
+
+函数签名：
+
+```python
+set_trailing_comma(line_text: str, should_have_comma: bool) -> str
+```
+
+### infer_port_indent
+
+作用：根据已有 header 端口行推断新端口应该使用的缩进。
+
+函数签名：
+
+```python
+infer_port_indent(
+    existing_ports: Sequence[HeaderPortLine],
+    source_text: str,
+    content_start: int,
+) -> str
 ```
 
 ### format_port_decl
@@ -646,7 +935,7 @@ format_port_decl(direction: str, width: str, signal_name: str) -> str
 示例：
 
 ```python
-from VerilogUtils import format_port_decl
+from utils.VerilogLanguageUtils import format_port_decl
 
 print(format_port_decl("input", "[7:0]", "data"))
 print(format_port_decl("output", "", "done"))
@@ -666,15 +955,26 @@ output done
 ```python
 from pathlib import Path
 
-from VerilogUtils import get_target_top_module, load_module_library, parse_module_instances
+from utils.VerilogLanguageUtils import (
+    analyze_signals,
+    get_target_top_module,
+    load_module_library,
+    parse_instances,
+    parse_internal_signal_names,
+)
+from utils.VerilogTextUtils import DEFAULT_VERILOG_EXTENSIONS
 
 top = get_target_top_module(Path("top.v"), "top_example")
-library = load_module_library(Path("."), [".v", ".sv"])
-instances = parse_module_instances(top.body)
+library = load_module_library(Path("."), DEFAULT_VERILOG_EXTENSIONS)
+refs = parse_instances(top, library)
+top_ports, internal_signals = analyze_signals(
+    refs,
+    parse_internal_signal_names(top),
+    forced_output_specs=set(),
+)
 
 print(top.name)
-print(sorted(library)[:3])
-print(len(instances))
+print(len(top_ports), len(internal_signals))
 ```
 
 ### 给 AutoInst 类脚本复用
@@ -693,12 +993,18 @@ print(len(instances))
 
 - `strip_comments_preserve_layout`
 - `parse_module_instances`
+- `parse_instances`
+- `parse_internal_signal_names`
+- `analyze_signals`
 - `extract_base_signal_name`
 - `normalize_width`
+- `locate_header_port_list`
+- `parse_header_port_lines`
+- `set_trailing_comma`
 - `replace_span`
 
 ## 说明
 
 - 当前工具集主要面向常见 Verilog/SystemVerilog 语法
 - 对宏展开、极复杂参数表达式、位置端口连接等高级场景暂未完全覆盖
-- 如果后续加入 `AutoWire/Reg` 和 `AutoInst`，建议优先往 `VerilogUtils.py` 中继续沉淀解析能力，而不是把解析逻辑散落到各入口脚本里
+- 如果后续加入 `AutoWire/Reg` 和 `AutoInst`，建议优先按职责往 `VerilogTextUtils.py` 或 `VerilogLanguageUtils.py` 中继续沉淀能力，而不是把解析逻辑散落到各入口脚本里

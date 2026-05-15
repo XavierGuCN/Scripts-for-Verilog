@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,37 +17,28 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.PyUtils import ensure_trailing_newline, indent_block, replace_span
-from utils.VerilogUtils import (
-    DEFAULT_VERILOG_EXTENSIONS,
+from utils.VerilogLanguageUtils import (
+    InstancePortRef,
     ModuleDef,
+    SignalAnalysis,
     VerilogAnalysisError,
-    extract_base_signal_name,
+    analyze_signals,
     format_port_decl,
     get_target_top_module,
+    locate_header_port_list,
     load_module_library,
-    normalize_decl_names,
-    parse_module_instances,
-    strip_comments,
-    strip_comments_preserve_layout,
+    parse_header_port_lines,
+    parse_instances,
+    parse_internal_signal_names,
+)
+from utils.VerilogTextUtils import (
+    DEFAULT_VERILOG_EXTENSIONS,
+    infer_port_indent,
+    set_trailing_comma,
+    split_line_ending,
 )
 
-INTERNAL_SIGNAL_DECL_RE = re.compile(
-    r"\b(?:wire|reg|logic|tri|wand|wor|uwire)\b\s*"
-    r"(?:signed|unsigned|\s)*"
-    r"(\[[^\]]+\])?\s*"
-    r"([^;]+?)\s*;",
-    re.S,
-)
 FORCE_OUTPUT_SPEC_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$]*)\.([A-Za-z_][A-Za-z0-9_$]*)$")
-IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
-
-
-@dataclass
-class HeaderPortLine:
-    name: str
-    start: int
-    end: int
-    text: str
 
 
 @dataclass
@@ -56,78 +46,6 @@ class IncrementalUpdateSummary:
     preserved_ports: List[str]
     added_ports: List[str]
     deleted_ports: List[str]
-
-
-@dataclass
-class InstancePortRef:
-    instance_name: str
-    module_name: str
-    port_name: str
-    signal_name: str
-    direction: str
-    width: str
-
-
-@dataclass
-class SignalAnalysis:
-    signal_name: str
-    top_direction: Optional[str]
-    width: str
-    reason: str
-    refs: List[InstancePortRef]
-
-
-def parse_instances(top_module: ModuleDef, module_library: Dict[str, ModuleDef]) -> List[InstancePortRef]:
-    refs: List[InstancePortRef] = []
-    for instance in parse_module_instances(top_module.body):
-        submodule_name = instance.module_name
-        instance_name = instance.instance_name
-
-        if submodule_name not in module_library:
-            raise VerilogAnalysisError(
-                f"Definition for instantiated module '{submodule_name}' (instance '{instance_name}') was not found."
-            )
-        submodule_def = module_library[submodule_name]
-
-        for connection in instance.connections:
-            port_name = connection.port_name
-            if port_name not in submodule_def.ports:
-                raise VerilogAnalysisError(
-                    f"Port '{port_name}' on instance '{instance_name}' was not found in module '{submodule_name}'."
-                )
-            signal_name = extract_base_signal_name(connection.expr)
-            if signal_name is None:
-                continue
-            port_def = submodule_def.ports[port_name]
-            refs.append(
-                InstancePortRef(
-                    instance_name=instance_name,
-                    module_name=submodule_name,
-                    port_name=port_name,
-                    signal_name=signal_name,
-                    direction=port_def.direction,
-                    width=port_def.width_clean,
-                )
-            )
-    return refs
-
-
-def ensure_same_width(signal_name: str, refs: Sequence[InstancePortRef]) -> str:
-    widths = {ref.width for ref in refs}
-    if len(widths) > 1:
-        detail = ", ".join(
-            f"{ref.instance_name}.{ref.port_name}={ref.width or 'scalar'}" for ref in refs
-        )
-        raise VerilogAnalysisError(f"Width mismatch detected on signal '{signal_name}': {detail}")
-    return next(iter(widths), "")
-
-
-def parse_internal_signal_names(top_module: ModuleDef) -> Set[str]:
-    declared_signals: Set[str] = set()
-    body_clean = strip_comments(top_module.body)
-    for _width, names_text in INTERNAL_SIGNAL_DECL_RE.findall(body_clean):
-        declared_signals.update(normalize_decl_names(names_text))
-    return declared_signals
 
 
 def load_force_output_specs(
@@ -166,100 +84,6 @@ def load_force_output_specs(
     return forced_specs
 
 
-def infer_default_top_direction(signal_name: str, refs: Sequence[InstancePortRef]) -> Tuple[Optional[str], str]:
-    directions = {ref.direction for ref in refs}
-
-    if len(refs) == 1:
-        return refs[0].direction, "single connection"
-
-    if directions == {"input"}:
-        return "input", "common input"
-
-    if directions == {"output"}:
-        detail = ", ".join(f"{ref.instance_name}.{ref.port_name}" for ref in refs)
-        raise VerilogAnalysisError(f"Signal '{signal_name}' is driven by multiple output ports only: {detail}")
-
-    if directions == {"inout"} or "inout" in directions:
-        return "inout", "contains inout connection"
-
-    if directions.issubset({"input", "output"}):
-        return None, "internal connection with both input and output endpoints"
-
-    raise VerilogAnalysisError(
-        f"Unsupported direction combination on signal '{signal_name}': {', '.join(sorted(directions))}"
-    )
-
-
-def analyze_signals(
-    refs: Sequence[InstancePortRef],
-    internal_signal_names: Set[str],
-    forced_output_specs: Set[Tuple[str, str]],
-) -> Tuple[List[SignalAnalysis], List[SignalAnalysis]]:
-    by_signal: Dict[str, List[InstancePortRef]] = defaultdict(list)
-    for ref in refs:
-        by_signal[ref.signal_name].append(ref)
-
-    top_ports_by_name: Dict[str, SignalAnalysis] = {}
-    internal_signals: List[SignalAnalysis] = []
-
-    for signal_name in sorted(by_signal):
-        signal_refs = by_signal[signal_name]
-        width = ensure_same_width(signal_name, signal_refs)
-        default_direction, default_reason = infer_default_top_direction(signal_name, signal_refs)
-        forced_refs = [
-            ref for ref in signal_refs if (ref.module_name, ref.port_name) in forced_output_specs
-        ]
-
-        if forced_refs:
-            directions = {ref.direction for ref in signal_refs}
-            if "inout" in directions:
-                raise VerilogAnalysisError(
-                    f"Signal '{signal_name}' cannot be forced to output because it also connects to inout ports."
-                )
-            top_ports_by_name[signal_name] = SignalAnalysis(
-                signal_name=signal_name,
-                top_direction="output",
-                width=width,
-                reason="forced as top output via force-output list",
-                refs=signal_refs,
-            )
-            continue
-
-        if signal_name in internal_signal_names:
-            internal_signals.append(
-                SignalAnalysis(
-                    signal_name=signal_name,
-                    top_direction=None,
-                    width=width,
-                    reason="kept internal because it is already declared in the top module",
-                    refs=signal_refs,
-                )
-            )
-            continue
-
-        if default_direction is None:
-            internal_signals.append(
-                SignalAnalysis(
-                    signal_name=signal_name,
-                    top_direction=None,
-                    width=width,
-                    reason=default_reason,
-                    refs=signal_refs,
-                )
-            )
-            continue
-
-        top_ports_by_name[signal_name] = SignalAnalysis(
-            signal_name=signal_name,
-            top_direction=default_direction,
-            width=width,
-            reason=default_reason,
-            refs=signal_refs,
-        )
-
-    return [top_ports_by_name[name] for name in sorted(top_ports_by_name)], internal_signals
-
-
 def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]) -> str:
     port_lines = [format_port_decl(port.top_direction or "wire", port.width, port.signal_name) for port in top_ports]
     if module_def.parameters:
@@ -285,99 +109,6 @@ def format_top_module(module_def: ModuleDef, top_ports: Sequence[SignalAnalysis]
     return "\n".join(header_lines) + "\n\nendmodule"
 
 
-def skip_whitespace(text: str, index: int) -> int:
-    while index < len(text) and text[index].isspace():
-        index += 1
-    return index
-
-
-def find_matching_paren(text: str, open_index: int) -> int:
-    depth = 0
-    for index in range(open_index, len(text)):
-        char = text[index]
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-    raise VerilogAnalysisError("Could not find matching ')' in module header.")
-
-
-def locate_header_port_list(source_text: str, module_def: ModuleDef) -> Tuple[int, int]:
-    clean_text = strip_comments_preserve_layout(source_text)
-    module_start, module_end = module_def.span
-    module_text = clean_text[module_start:module_end]
-    module_match = re.search(r"\bmodule\s+" + re.escape(module_def.name) + r"\b", module_text)
-    if not module_match:
-        raise VerilogAnalysisError(f"Could not locate module header for '{module_def.name}'.")
-
-    index = module_start + module_match.end()
-    index = skip_whitespace(clean_text, index)
-    if index < module_end and clean_text[index] == "#":
-        index = skip_whitespace(clean_text, index + 1)
-        if index >= module_end or clean_text[index] != "(":
-            raise VerilogAnalysisError(f"Unsupported parameter list syntax in module '{module_def.name}'.")
-        index = find_matching_paren(clean_text, index) + 1
-        index = skip_whitespace(clean_text, index)
-
-    if index >= module_end or clean_text[index] != "(":
-        raise VerilogAnalysisError(f"Could not locate port list in module '{module_def.name}'.")
-
-    close_index = find_matching_paren(clean_text, index)
-    return index + 1, close_index
-
-
-def iter_line_spans(text: str, start: int, end: int) -> List[Tuple[int, int, str]]:
-    lines: List[Tuple[int, int, str]] = []
-    index = start
-    while index < end:
-        newline_index = text.find("\n", index, end)
-        line_end = end if newline_index == -1 else newline_index + 1
-        lines.append((index, line_end, text[index:line_end]))
-        index = line_end
-    return lines
-
-
-def parse_header_port_name(line_text: str) -> Optional[str]:
-    stripped = line_text.lstrip()
-    if not stripped or stripped.startswith("//"):
-        return None
-
-    clean_line = strip_comments(line_text).strip()
-    if not clean_line:
-        return None
-
-    clean_line = clean_line.rstrip(",").strip()
-    if not clean_line:
-        return None
-
-    name_match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)\s*$", clean_line)
-    if not name_match:
-        return None
-    name = name_match.group(1)
-    if not IDENT_RE.match(name):
-        return None
-    return name
-
-
-def parse_header_port_lines(source_text: str, content_start: int, content_end: int) -> List[HeaderPortLine]:
-    port_lines: List[HeaderPortLine] = []
-    for line_start, line_end, line_text in iter_line_spans(source_text, content_start, content_end):
-        port_name = parse_header_port_name(line_text)
-        if port_name:
-            port_lines.append(HeaderPortLine(name=port_name, start=line_start, end=line_end, text=line_text))
-    return port_lines
-
-
-def split_line_ending(line_text: str) -> Tuple[str, str]:
-    if line_text.endswith("\r\n"):
-        return line_text[:-2], "\r\n"
-    if line_text.endswith("\n"):
-        return line_text[:-1], "\n"
-    return line_text, ""
-
-
 def comment_deleted_port_line(line_text: str, timestamp: str) -> str:
     body, newline = split_line_ending(line_text)
     indent_match = re.match(r"^(\s*)", body)
@@ -386,45 +117,6 @@ def comment_deleted_port_line(line_text: str, timestamp: str) -> str:
     if not content:
         return line_text
     return f"{indent}// {content} // delete {timestamp}{newline}"
-
-
-def has_trailing_comma(line_text: str) -> bool:
-    clean_line = strip_comments(line_text).rstrip()
-    return clean_line.endswith(",")
-
-
-def set_trailing_comma(line_text: str, should_have_comma: bool) -> str:
-    if has_trailing_comma(line_text) == should_have_comma:
-        return line_text
-
-    body, newline = split_line_ending(line_text)
-    comment_index = body.find("//")
-    code = body if comment_index == -1 else body[:comment_index]
-    comment = "" if comment_index == -1 else body[comment_index:]
-
-    if should_have_comma:
-        updated_code = code.rstrip() + ","
-        spacing = "" if not comment else " "
-        return f"{updated_code}{spacing}{comment}{newline}"
-
-    updated_code = re.sub(r",\s*$", "", code.rstrip())
-    spacing = "" if not comment else " "
-    return f"{updated_code}{spacing}{comment}{newline}"
-
-
-def infer_port_indent(existing_ports: Sequence[HeaderPortLine], source_text: str, content_start: int) -> str:
-    for port in existing_ports:
-        indent_match = re.match(r"^(\s*)", port.text)
-        if indent_match and port.text.strip():
-            return indent_match.group(1)
-
-    line_start = source_text.rfind("\n", 0, content_start)
-    module_indent = ""
-    if line_start != -1:
-        header_line = source_text[line_start + 1 : content_start]
-        module_indent_match = re.match(r"^(\s*)", header_line)
-        module_indent = module_indent_match.group(1) if module_indent_match else ""
-    return module_indent + "    "
 
 
 def build_autoport_block(new_ports: Sequence[SignalAnalysis], indent: str, timestamp: str) -> str:
